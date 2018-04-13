@@ -82,6 +82,7 @@ CSndLossList::~CSndLossList()
    #endif
 }
 
+// 将[sq1, sq2]加入到list
 int CSndLossList::insert(int32_t seqno1, int32_t seqno2)
 {
    CGuard listguard(m_ListLock);
@@ -646,6 +647,8 @@ bool CRcvLossList::remove(int32_t seqno1, int32_t seqno2)
    return true;
 }
 
+
+// [seqno1, seqno2]该区间内有没有丢失的序列号
 bool CRcvLossList::find(int32_t seqno1, int32_t seqno2) const
 {
    if (0 == m_iLength)

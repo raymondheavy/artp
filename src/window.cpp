@@ -200,6 +200,7 @@ int CPktTimeWindow::getPktRcvSpeed() const
    int* p = m_piPktWindow;
    for (int i = 0, n = m_iAWSize; i < n; ++ i)
    {
+      // 剔除与中值偏差较大的值
       if ((*p < upper) && (*p > lower))
       {
          ++ count;
@@ -209,6 +210,7 @@ int CPktTimeWindow::getPktRcvSpeed() const
    }
 
    // claculate speed, or return 0 if not enough valid value
+   // 包到达速率，单位是 pkts/s
    if (count > (m_iAWSize >> 1))
       return (int)ceil(1000000.0 / (sum / count));
    else
@@ -217,8 +219,11 @@ int CPktTimeWindow::getPktRcvSpeed() const
 
 int CPktTimeWindow::getBandwidth() const
 {
+   // m_piProbeWindow记录前后两个探测包到达的时间间隔
    // get median value, but cannot change the original value order in the window
    std::copy(m_piProbeWindow, m_piProbeWindow + m_iPWSize - 1, m_piProbeReplica);
+
+   // 使第n大元素处于第n位置（从0开始,其位置是下标为 n的元素），比这个元素小的元素都排在这个元素之前，比这个元素大的元素都排在这个元素之后，但不能保证它们是有序的
    std::nth_element(m_piProbeReplica, m_piProbeReplica + (m_iPWSize / 2), m_piProbeReplica + m_iPWSize - 1);
    int median = m_piProbeReplica[m_iPWSize / 2];
 
@@ -239,6 +244,7 @@ int CPktTimeWindow::getBandwidth() const
       ++ p;
    }
 
+   // 包到达速率，单位是 pkts/s
    return (int)ceil(1000000.0 / (double(sum) / double(count)));
 }
 
@@ -277,6 +283,7 @@ void CPktTimeWindow::probe2Arrival()
 {
    m_CurrArrTime = CTimer::getTime();
 
+   // m_piProbeWindow记录前后两个探测包到达的时间间隔
    // record the probing packets interval
    *(m_piProbeWindow + m_iProbeWindowPtr) = int(m_CurrArrTime - m_ProbeTime);
    // the window is logically circular

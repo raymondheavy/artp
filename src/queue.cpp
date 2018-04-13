@@ -112,9 +112,11 @@ int CUnitQueue::init(int size, int mss, int version)
    tempq->m_pBuffer = tempb;
    tempq->m_iSize = size;
 
+   // 开始时，只有一个队列
    m_pQEntry = m_pCurrQueue = m_pLastQueue = tempq;
    m_pQEntry->m_pNext = m_pQEntry;
 
+   // 可用单元从当前队列的第一个单元开始
    m_pAvailUnit = m_pCurrQueue->m_pUnit;
 
    m_iSize = size;
@@ -126,6 +128,7 @@ int CUnitQueue::init(int size, int mss, int version)
 
 int CUnitQueue::increase()
 {
+   // 统计所有队列中未被占用的单元数
    // adjust/correct m_iCount
    int real_count = 0;
    CQEntry* p = m_pQEntry;
@@ -141,6 +144,7 @@ int CUnitQueue::increase()
       else
          p = p->m_pNext;
    }
+   // 可用率不足90%时需要增加
    m_iCount = real_count;
    if (double(m_iCount) / m_iSize < 0.9)
       return -1;
@@ -176,6 +180,8 @@ int CUnitQueue::increase()
    tempq->m_pBuffer = tempb;
    tempq->m_iSize = size;
 
+   // 队列是环形的
+   // 队列中的单元是数组形式的
    m_pLastQueue->m_pNext = tempq;
    m_pLastQueue = tempq;
    m_pLastQueue->m_pNext = m_pQEntry;
@@ -193,20 +199,26 @@ int CUnitQueue::shrink()
 
 CUnit* CUnitQueue::getNextAvailUnit()
 {
+   // m_iCount 被占用的个数
+   // m_iSize 总个数
    if (m_iCount * 10 > m_iSize * 9)
       increase();
 
+   // 没有可用的
    if (m_iCount >= m_iSize)
       return NULL;
 
    CQEntry* entrance = m_pCurrQueue;
 
+   // 在所有队列中查找可用单元，并从当前队列开始查找
    do
    {
+      // 在当前队列中查找是否有可用单元（除最后一个单元外）
       for (CUnit* sentinel = m_pCurrQueue->m_pUnit + m_pCurrQueue->m_iSize - 1; m_pAvailUnit != sentinel; ++ m_pAvailUnit)
          if (m_pAvailUnit->m_iFlag == 0)
             return m_pAvailUnit;
 
+      // 当前队列第一个单元是否可用。如果可用，则继续使用当前队列
       if (m_pCurrQueue->m_pUnit->m_iFlag == 0)
       {
          m_pAvailUnit = m_pCurrQueue->m_pUnit;
@@ -279,6 +291,11 @@ void CSndUList::insert(int64_t ts, const CUDT* u)
    insert_(ts, u);
 }
 
+// 更新指定的UDT实例使之在下一个处理周期时第一个被处理
+// 如果列表中不存在该实例，则插入，尽量在前（时间戳为最小值1）
+// 如果列表中已存在，则依据其是否希望被重新调度（立即），进行不同的处理。
+// 不希望被重新调度，则不作处理；
+// 反之，则判断是否为第一个，如果为第一个，则中断计时器计时，以让该实例在下一个处理周期时得到立即处理，不再sleepto；不是第一个则先删除再重新插入到顶端。
 void CSndUList::update(const CUDT* u, bool reschedule)
 {
    CGuard listguard(m_ListLock);
@@ -978,6 +995,8 @@ void CRcvQueue::init(int qsize, int payload, int version, int hsize, CChannel* c
    CUDT* u = NULL;
    int32_t id;
 
+   // m_bClosing在析构函数置为true
+
    while (!self->m_bClosing)
    {
       #ifdef NO_BUSY_WAITING
@@ -995,6 +1014,21 @@ void CRcvQueue::init(int qsize, int payload, int version, int hsize, CChannel* c
          }
       }
 
+      // 是否有可用的存储单元以接收数据包
+
+      // 对于控制报文，存储单元只会暂时存储控制报文，占用标示不会被置1（仍为可用）。该控制报文被即时处理。
+      // 因为是单线程处理接收，即使该存储单元的占用标示没有被置1，也不会被另外的调用者使用到该存储单元。
+
+      // 对于数据报文，存储单元存储报文后，会被放入接收缓冲区中等待被处理，存储单元的占用标示被置1。
+      // 接收缓冲区有大小限制。如果因为接收缓冲区已满，该单元未被放入，该存储单元的占用标示仍为0，可用状态。
+
+      // self->m_UnitQueue.getNextAvailUnit()内部会自动增加可用单元，但并不是无限制的。
+      // 限制来自于接收缓冲区RecvBuffer。
+      // 在上层来不及处理接收缓冲区中的数据时，为了接收数据，self->m_UnitQueue.getNextAvailUnit()自动增加存储单元，并持续到接收缓冲区满。
+      // 如果接收缓冲区已满，存储单元就无法被放入接收缓冲区，就将一直处于可用状态（报文会被覆盖处理）。后续就不会再增加存储单元，存储单元数此时达到最大。
+
+      // 如果有可用单元用来接收报文，就说明有可用单元接收控制报文。
+      
       // find next available slot for incoming packet
       CUnit* unit = self->m_UnitQueue.getNextAvailUnit();
       if (NULL == unit)
@@ -1020,6 +1054,7 @@ void CRcvQueue::init(int qsize, int payload, int version, int hsize, CChannel* c
       if (0 == id)
       {
          if (NULL != self->m_pListener)
+            // cookie无效，不做任何处理。
             self->m_pListener->listen(addr, unit->m_Packet);
          else if (NULL != (u = self->m_pRendezvousQueue->retrieve(addr, id)))
          {
@@ -1035,6 +1070,7 @@ void CRcvQueue::init(int qsize, int payload, int version, int hsize, CChannel* c
       {
          if (NULL != (u = self->m_pHash->lookup(id)))
          {
+            // 根据收到的UDP包中的源地址查找到相对应的UDT实例
             if (CIPAddress::ipcmp(addr, u->m_pPeerAddr, u->m_iIPversion))
             {
                if (u->m_bConnected && !u->m_bBroken && !u->m_bClosing)
@@ -1072,7 +1108,12 @@ TIMER_CHECK:
 
          if (u->m_bConnected && !u->m_bBroken && !u->m_bClosing)
          {
+            // 更新拥塞控制相关参数（报文发送时间间隔 拥塞窗口）
+            // 处理ACk事件（是不是该发送ACK了？如果需发送，则发送）
+            // 处理超时事件（处理长期不活动的连接、数据重传、保活等）
             u->checkTimers();
+
+            // 将该U放到最后
             self->m_pRcvUList->update(u);
          }
          else

@@ -222,7 +222,7 @@ protected:
 private:
    UDTSOCKET m_UDT;                     // The UDT entity that this congestion control algorithm is bound to
 
-   int m_iACKPeriod;                    // Periodical timer to send an ACK, in milliseconds
+   int m_iACKPeriod;                    // Periodical timer to send an ACK, in milliseconds（单位应该是微秒）
    int m_iACKInterval;                  // How many packets to send one ACK, in packets
 
    bool m_bUserDefinedRTO;              // if the RTO value is defined by users

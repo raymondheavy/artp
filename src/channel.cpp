@@ -120,6 +120,16 @@ void CChannel::open(const sockaddr* addr)
       hints.ai_family = m_iIPversion;
       hints.ai_socktype = SOCK_DGRAM;
 
+/*
+If the AI_PASSIVE flag is specified in hints.ai_flags, and node is NULL, 
+then the returned socket addresses will be suitable for bind(2)ing a socket that will accept(2) connections. 
+The returned socket address will contain the "wildcard address" (INADDR_ANY for IPv4 addresses, IN6ADDR_ANY_INIT for IPv6 address). 
+The wildcard address is used by applications (typically servers) that intend to accept connections on any of the hosts's network addresses. 
+
+"0" 代表告知系统分配下一个可用的端口
+
+实际分配需在bind之后才能确定。
+*/
       if (0 != ::getaddrinfo(NULL, "0", &hints, &res))
          throw CUDTException(1, 3, NET_ERROR);
 
@@ -280,6 +290,8 @@ int CChannel::sendto(const sockaddr* addr, CPacket& packet) const
    return res;
 }
 
+
+// addr存放了UDP包中的源地址
 int CChannel::recvfrom(sockaddr* addr, CPacket& packet) const
 {
    #ifndef WIN32

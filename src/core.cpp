@@ -597,10 +597,11 @@ void CUDT::connect(const sockaddr* serv_addr)
    m_ConnReq.m_iVersion = m_iVersion;
    m_ConnReq.m_iType = m_iSockType;
    m_ConnReq.m_iMSS = m_iMSS;
+   // 客户端的m_iFlightFlagSize
    m_ConnReq.m_iFlightFlagSize = (m_iRcvBufSize < m_iFlightFlagSize)? m_iRcvBufSize : m_iFlightFlagSize;
-   m_ConnReq.m_iReqType = (!m_bRendezvous) ? 1 : 0;
+   m_ConnReq.m_iReqType = (!m_bRendezvous) ? 1 : 0; // 1: regular 0: rendezvous
    m_ConnReq.m_iID = m_SocketID;
-   CIPAddress::ntop(serv_addr, m_ConnReq.m_piPeerIP, m_iIPversion);
+   CIPAddress::ntop(serv_addr, m_ConnReq.m_piPeerIP, m_iIPversion); // PeerIP：server的IP
 
    // Random Initial Sequence Number
    srand((unsigned int)CTimer::getTime());
@@ -621,6 +622,8 @@ void CUDT::connect(const sockaddr* serv_addr)
    request.m_iID = 0;
 
    int hs_size = m_iPayloadSize;
+
+   // serialize更新了hs_size为实际大小
    m_ConnReq.serialize(reqdata, hs_size);
    request.setLength(hs_size);
    m_pSndQueue->sendto(serv_addr, request);
@@ -650,7 +653,7 @@ void CUDT::connect(const sockaddr* serv_addr)
          m_ConnReq.serialize(reqdata, hs_size);
          request.setLength(hs_size);
          if (m_bRendezvous)
-            request.m_iID = m_ConnRes.m_iID;
+            request.m_iID = m_ConnRes.m_iID; // Destination Socket ID 对端的socket id（m_ConnRes为对端发来的请求，携带其本地信息）
          m_pSndQueue->sendto(serv_addr, request);
          m_llLastReqTime = CTimer::getTime();
       }
@@ -658,6 +661,7 @@ void CUDT::connect(const sockaddr* serv_addr)
       response.setLength(m_iPayloadSize);
       if (m_pRcvQueue->recvfrom(m_SocketID, response) > 0)
       {
+         // = 0：连接建立成功
          if (connect(response) <= 0)
             break;
 
@@ -690,6 +694,8 @@ void CUDT::connect(const sockaddr* serv_addr)
       throw e;
 }
 
+// connect(const sockaddr* serv_addr)中调用该函数
+// 收到对端回复的握手报文后
 int CUDT::connect(const CPacket& response) throw ()
 {
    // this is the 2nd half of a connection request. If the connection is setup successfully this returns 0.
@@ -699,6 +705,7 @@ int CUDT::connect(const CPacket& response) throw ()
    if (!m_bConnecting)
       return -1;
 
+   // m_bRendezvous模式下，对端发来的报文为数据包或者keep-alive报文
    if (m_bRendezvous && ((0 == response.getFlag()) || (1 == response.getType())) && (0 != m_ConnRes.m_iType))
    {
       //a data packet or a keep-alive packet comes, which means the peer side is already connected
@@ -706,6 +713,7 @@ int CUDT::connect(const CPacket& response) throw ()
       goto POST_CONNECT;
    }
 
+   // 非控制包，或者非握手包
    if ((1 != response.getFlag()) || (0 != response.getType()))
       return -1;
 
@@ -718,6 +726,9 @@ int CUDT::connect(const CPacket& response) throw ()
       if (1 == m_ConnRes.m_iReqType)
          return -1;
 
+      // m_ConnReq.m_iReqType：收到对端报文的情况下会被更新为-1
+      // m_ConnRes.m_iReqType：收到对端第二次发来的报文（确保对端收到本端发送的报文的情况下）会被更新为-1
+      // m_ConnReq.m_iReqType m_ConnRes.m_iReqType都更新为-1的情况下，正好为3次握手
       if ((0 == m_ConnReq.m_iReqType) || (0 == m_ConnRes.m_iReqType))
       {
          m_ConnReq.m_iReqType = -1;
@@ -729,6 +740,7 @@ int CUDT::connect(const CPacket& response) throw ()
    else
    {
       // set cookie
+      // 准备发送第三次握手报文
       if (1 == m_ConnRes.m_iReqType)
       {
          m_ConnReq.m_iReqType = -1;
@@ -744,6 +756,8 @@ POST_CONNECT:
 
    // Re-configure according to the negotiated values.
    m_iMSS = m_ConnRes.m_iMSS;
+
+   // 用对端的m_iFlightFlagSize更新本地的m_iFlowWindowSize
    m_iFlowWindowSize = m_ConnRes.m_iFlightFlagSize;
    m_iPktSize = m_iMSS - 28;
    m_iPayloadSize = m_iPktSize - CPacket::m_iPktHdrSize;
@@ -752,11 +766,16 @@ POST_CONNECT:
    m_iRcvLastAckAck = m_ConnRes.m_iISN;
    m_iRcvCurrSeqNo = m_ConnRes.m_iISN - 1;
    m_PeerID = m_ConnRes.m_iID;
+
+   // c/s模式下，收到server发来的第4次握手报文，m_ConnRes.m_piPeerIP为server端看到的对端地址，也就是c端最后一级路由地址
+   // m_piSelfIP s端看到的c地址
    memcpy(m_piSelfIP, m_ConnRes.m_piPeerIP, 16);
 
    // Prepare all data structures
    try
    {
+      // UDT实例拥有各自的发送缓存、接收缓存以及丢失链表等
+      // 复用器实例拥有发送队列（UDT实例链表）、接收队列（UDT实例链表）、通道
       m_pSndBuffer = new CSndBuffer(32, m_iPayloadSize);
       m_pRcvBuffer = new CRcvBuffer(&(m_pRcvQueue->m_UnitQueue), m_iRcvBufSize);
       // after introducing lite ACK, the sndlosslist may not be cleared in time, so it requires twice space.
@@ -810,6 +829,7 @@ POST_CONNECT:
    return 0;
 }
 
+// 被newConnection()调用
 void CUDT::connect(const sockaddr* peer, CHandShake* hs)
 {
    CGuard cg(m_ConnectionLock);
@@ -821,7 +841,9 @@ void CUDT::connect(const sockaddr* peer, CHandShake* hs)
       m_iMSS = hs->m_iMSS;
 
    // exchange info for maximum flow window size
+   // 用对端的m_iFlightFlagSize更新本地的m_iFlowWindowSize
    m_iFlowWindowSize = hs->m_iFlightFlagSize;
+   // 将server端的m_iFlightFlagSize发送给c端
    hs->m_iFlightFlagSize = (m_iRcvBufSize < m_iFlightFlagSize)? m_iRcvBufSize : m_iFlightFlagSize;
 
    m_iPeerISN = hs->m_iISN;
@@ -847,7 +869,10 @@ void CUDT::connect(const sockaddr* peer, CHandShake* hs)
    hs->m_iReqType = -1;
 
    // get local IP address and send the peer its IP address (because UDP cannot get local IP address)
+   // m_piSelfIP c端发起连接时的目的地址
    memcpy(m_piSelfIP, hs->m_piPeerIP, 16);
+   // 更新握手报文中的PeerIP为 收到的握手报文中的源地址（也就是server端能看到的对端地址），并将该地址发给连接发起端
+   // server端将向对端发送第4次握手报文
    CIPAddress::ntop(peer, hs->m_piPeerIP, m_iIPversion);
   
    m_iPktSize = m_iMSS - 28;
@@ -907,7 +932,8 @@ void CUDT::connect(const sockaddr* peer, CHandShake* hs)
    char* buffer = new char[size];
    hs->serialize(buffer, size);
    response.pack(0, NULL, buffer, size);
-   response.m_iID = m_PeerID;
+   response.m_iID = m_PeerID; // 目的socket ID
+   // 向连接发起端发送第4次（建立连接过程中最后一次）握手报文
    m_pSndQueue->sendto(peer, response);
    delete [] buffer;
 }
@@ -917,10 +943,31 @@ void CUDT::close()
    if (!m_bOpened)
       return;
 
+//    Linux下tcp连接断开的时候调用close()函数，有优雅断开和强制断开两种方式。
+//    linger结构体数据结构如下：
+//    struct linger {
+//        　　int l_onoff;
+//          　　int l_linger;
+//    };
+// 
+//    三种断开方式：
+//        1. l_onoff = 0; l_linger忽略
+//        close()立刻返回，底层会将未发送完的数据发送完成后再释放资源，即优雅退出。
+// 
+//        2. l_onoff != 0; l_linger = 0;
+//        close()立刻返回，但不会发送未发送完成的数据，而是通过一个REST包强制的关闭socket描述符，即强制退出。
+// 
+//        3. l_onoff != 0; l_linger > 0;
+//        close()不会立刻返回，内核会延迟一段时间，这个时间就由l_linger的值来决定。
+//        如果超时时间到达之前，发送完未发送的数据(包括FIN包)并得到另一端的确认，close()会返回正确，socket描述符优雅性退出。
+//        否则，close()会直接返回错误值，未发送数据丢失，socket描述符被强制性退出。
+//        需要注意的时，如果socket描述符被设置为非堵塞型，则close()会直接返回值。
+
    if (0 != m_Linger.l_onoff)
    {
       uint64_t entertime = CTimer::getTime();
 
+      // 在未被强制关闭（m_bBroken=false）的情况下，关闭套接字需等待发送
       while (!m_bBroken && m_bConnected && (m_pSndBuffer->getCurrBufSize() > 0) && (CTimer::getTime() - entertime < m_Linger.l_linger * 1000000ULL))
       {
          // linger has been checked by previous close() call and has expired
@@ -930,6 +977,7 @@ void CUDT::close()
          if (!m_bSynSending)
          {
             // if this socket enables asynchronous sending, return immediately and let GC to close it later
+            // 异步发送的情况下，设置关闭超时时间
             if (0 == m_ullLingerExpiration)
                m_ullLingerExpiration = entertime + m_Linger.l_linger * 1000000ULL;
 
@@ -1034,8 +1082,10 @@ int CUDT::send(const char* data, int len)
       m_ullLastRspTime = currtime;
    }
 
+   // 待发送数据的大小已超过设定的发送缓冲区大小，需等待
    if (m_iSndBufSize <= m_pSndBuffer->getCurrBufSize())
    {
+      // 异步模式下抛出异常
       if (!m_bSynSending)
          throw CUDTException(6, 1, 0);
       else
@@ -1282,6 +1332,7 @@ int CUDT::sendmsg(const char* data, int len, int msttl, bool inorder)
       }
    }
 
+   // 剩余缓冲区大小
    if ((m_iSndBufSize - m_pSndBuffer->getCurrBufSize()) * m_iPayloadSize < len)
    {
       if (m_iSndTimeOut >= 0)
@@ -1751,6 +1802,7 @@ void CUDT::sendCtrl(int pkttype, void* lparam, void* rparam, int size)
       else
          ack = m_pRcvLossList->getFirstLostSeq();
 
+      // 如果对端已经收到过这个ACK，不再重复发送
       if (ack == m_iRcvLastAckAck)
          break;
 
@@ -1769,12 +1821,15 @@ void CUDT::sendCtrl(int pkttype, void* lparam, void* rparam, int size)
       CTimer::rdtsc(currtime);
 
       // There are new received packets to acknowledge, update related information.
+      // ack：序列号小于ack的报文都已收到
+      // m_iRcvLastAck：上次发送ACK时确认的序列号
       if (CSeqNo::seqcmp(ack, m_iRcvLastAck) > 0)
       {
          int acksize = CSeqNo::seqoff(m_iRcvLastAck, ack);
 
          m_iRcvLastAck = ack;
 
+         // 在接收缓冲区中确认新收到的数据，并触发事件（select epoll中等待了该事件，该事件作用？）
          m_pRcvBuffer->ackData(acksize);
 
          // signal a waiting "recv" call if there is any data available
@@ -1793,6 +1848,7 @@ void CUDT::sendCtrl(int pkttype, void* lparam, void* rparam, int size)
       }
       else if (ack == m_iRcvLastAck)
       {
+         // 判断是否需要重传该序列号的ACK数据报。RTO：超时重传。
          if ((currtime - m_ullLastAckTime) < ((m_iRTT + 4 * m_iRTTVar) * m_ullCPUFrequency))
             break;
       }
@@ -1800,6 +1856,8 @@ void CUDT::sendCtrl(int pkttype, void* lparam, void* rparam, int size)
          break;
 
       // Send out the ACK only if has not been received by the sender before
+      // m_iRcvLastAck：本次ACK序列号
+      // m_iRcvLastAckAck：上一次向发送端成功发送的ACK序列号
       if (CSeqNo::seqcmp(m_iRcvLastAck, m_iRcvLastAckAck) > 0)
       {
          int32_t data[6];
@@ -1813,6 +1871,7 @@ void CUDT::sendCtrl(int pkttype, void* lparam, void* rparam, int size)
          if (data[3] < 2)
             data[3] = 2;
 
+         // 一个速率控制周期内只向对方发送一次收包速率与带宽
          if (currtime - m_ullLastAckTime > m_ullSYNInt)
          {
             data[4] = m_pRcvTimeWindow->getPktRcvSpeed();
@@ -1829,6 +1888,7 @@ void CUDT::sendCtrl(int pkttype, void* lparam, void* rparam, int size)
          ctrlpkt.m_iID = m_PeerID;
          m_pSndQueue->sendto(m_pPeerAddr, ctrlpkt);
 
+         // 记录下该ACK报文的发送时间
          m_pACKWindow->store(m_iAckSeqNo, m_iRcvLastAck);
 
          ++ m_iSentACK;
@@ -1965,6 +2025,8 @@ void CUDT::processCtrl(CPacket& ctrlpkt)
       {
       int32_t ack;
 
+      // m_iSndLastAck 收到的数值最大的ack，m_iSndLastAck
+
       // process a lite ACK
       if (4 == ctrlpkt.getLength())
       {
@@ -1984,6 +2046,7 @@ void CUDT::processCtrl(CPacket& ctrlpkt)
       // send ACK acknowledgement
       // number of ACK2 can be much less than number of ACK
       uint64_t now = CTimer::getTime();
+      // 间隔一个速率控制周期 或者 ack2报文需要重发（接收端没有收到该ACK的ACK2）
       if ((currtime - m_ullSndLastAck2Time > (uint64_t)m_iSYNInterval) || (ack == m_iSndLastAck2))
       {
          sendCtrl(6, &ack);
@@ -1994,6 +2057,7 @@ void CUDT::processCtrl(CPacket& ctrlpkt)
       // Got data ACK
       ack = *(int32_t *)ctrlpkt.m_pcData;
 
+      // 校验ACK报文所确认的报文序列号（不可能大于目前已经发送出去的报文的最大序列号）
       // check the validation of the ack
       if (CSeqNo::seqcmp(ack, CSeqNo::incseq(m_iSndCurrSeqNo)) > 0)
       {
@@ -2013,6 +2077,9 @@ void CUDT::processCtrl(CPacket& ctrlpkt)
       // protect packet retransmission
       CGuard::enterCS(m_AckLock);
 
+      // m_iSndLastAck记录最大的ack，包括了lite ack。代表对端确认小于ack的报文都已收到
+      // 上次收到的m_iSndLastDataAck，最大的普通ack。在不丢失普通ack的情况下，同m_iSndLastAck。
+      // m_iSndLastDataAck是用来更新send buffer的依据。
       int offset = CSeqNo::seqoff(m_iSndLastDataAck, ack);
       if (offset <= 0)
       {
@@ -2062,6 +2129,7 @@ void CUDT::processCtrl(CPacket& ctrlpkt)
 
       if (ctrlpkt.getLength() > 16)
       {
+         // 根据对端传过来的数据更新
          // Update Estimated Bandwidth and packet delivery rate
          if (*((int32_t *)ctrlpkt.m_pcData + 4) > 0)
             m_iDeliveryRate = (m_iDeliveryRate * 7 + *((int32_t *)ctrlpkt.m_pcData + 4)) >> 3;
@@ -2073,6 +2141,7 @@ void CUDT::processCtrl(CPacket& ctrlpkt)
          m_pCC->setBandwidth(m_iBandwidth);
       }
 
+      // 发送速率调整
       m_pCC->onACK(ack);
       CCUpdate();
 
@@ -2088,6 +2157,7 @@ void CUDT::processCtrl(CPacket& ctrlpkt)
       int rtt = -1;
 
       // update RTT
+      // 找到对应的ACK报文发送出去的时间，计算RTT
       rtt = m_pACKWindow->acknowledge(ctrlpkt.getAckSeqNo(), ack);
       if (rtt <= 0)
          break;
@@ -2117,9 +2187,15 @@ void CUDT::processCtrl(CPacket& ctrlpkt)
 
       bool secure = true;
 
+      // 接收方Reneging，所谓Reneging的意思就是接收方有权把已经报给发送端SACK里的数据给丢了。
+      // 这样干是不被鼓励的，因为这个事会把问题复杂化了，但是，接收方这么做可能会有些极端情况，比如要把内存给别的更重要的东西。
+      // 所以，发送方也不能完全依赖SACK，还是要依赖ACK，并维护Time-Out，如果后续的ACK没有增长，那么还是要把SACK的东西重传，
+      // 另外，接收端这边永远不能把SACK的包标记为Ack。
+
       // decode loss list message and insert loss into the sender loss list
       for (int i = 0, n = (int)(ctrlpkt.getLength() / 4); i < n; ++ i)
       {
+         // 序列号区间(a, b) a最高位为1
          if (0 != (losslist[i] & 0x80000000))
          {
             if ((CSeqNo::seqcmp(losslist[i] & 0x7FFFFFFF, losslist[i + 1]) > 0) || (CSeqNo::seqcmp(losslist[i + 1], m_iSndCurrSeqNo) > 0))
@@ -2130,6 +2206,11 @@ void CUDT::processCtrl(CPacket& ctrlpkt)
             }
 
             int num = 0;
+
+            // 已经确认收到过的不再添加进丢失列表
+            // m_iSndLastAck=2000 losslist[i]=3000 losslist[i+1]=4000 insert[3000, 4000]
+            // m_iSndLastAck=2000 losslist[i]=1000 losslist[i+1]=3000 insert[2000, 3000]
+            // 当前模式下，接收端没有定时发送NAK消息的机制，如果NAK消息有丢失，则丢失的NAK消息中的序列号所标识的报文只能等超时发送
             if (CSeqNo::seqcmp(losslist[i] & 0x7FFFFFFF, m_iSndLastAck) >= 0)
                num = m_pSndLossList->insert(losslist[i] & 0x7FFFFFFF, losslist[i + 1]);
             else if (CSeqNo::seqcmp(losslist[i + 1], m_iSndLastAck) >= 0)
@@ -2195,9 +2276,14 @@ void CUDT::processCtrl(CPacket& ctrlpkt)
          // The peer side has not received the handshake message, so it keeps querying
          // resend the handshake packet
 
+         // 对端没有收到握手消息，所以一直在查询
+         // 重发握手数据包
+         // 重发的握手数据包中不包含版本信息
+
          CHandShake initdata;
          initdata.m_iISN = m_iISN;
          initdata.m_iMSS = m_iMSS;
+         // m_iFlightFlagSize 重发时没有比较m_iRcvBufSize与m_iFlightFlagSize的大小
          initdata.m_iFlightFlagSize = m_iFlightFlagSize;
          initdata.m_iReqType = (!m_bRendezvous) ? -1 : -2;
          initdata.m_iID = m_SocketID;
@@ -2230,6 +2316,8 @@ void CUDT::processCtrl(CPacket& ctrlpkt)
       m_pRcvLossList->remove(*(int32_t*)ctrlpkt.m_pcData, *(int32_t*)(ctrlpkt.m_pcData + 4));
 
       // move forward with current recv seq no.
+      // 如果下一个收取的为MSG或正处于MSG时，跳过Msg所覆盖的 seq no 区间
+      // seq1 <= (m_iRcvCurrSeqNo + 1) && seq2 > m_iRcvCurrSeqNo
       if ((CSeqNo::seqcmp(*(int32_t*)ctrlpkt.m_pcData, CSeqNo::incseq(m_iRcvCurrSeqNo)) <= 0)
          && (CSeqNo::seqcmp(*(int32_t*)(ctrlpkt.m_pcData + 4), m_iRcvCurrSeqNo) > 0))
       {
@@ -2260,6 +2348,15 @@ void CUDT::processCtrl(CPacket& ctrlpkt)
    }
 }
 
+// 打包出一个报文，返回值大于0才说明打包成功。
+// 返回值 = 0 说明无数据可打包。
+
+// 发送丢失链表不为空，则从中取出第一个报文序列号，并将该序列号删除（也就意味着如果该报文再次丢失，则只能在再次被添加到发送丢失链表中时重发）
+// !!!重传丢失报文不受拥塞窗口的限制，拥塞窗口代表了接收端的接收能力。既然报文被标示为丢失，说明接收端有能力接收该报文。
+
+// ts代表该UDT下一次被调度的时间
+// ts = 0 : 发送丢失链表为空的情况下，发送窗口已满或发送缓冲区无数据发送。
+// pop调用packData后发现如果此次没有可发送数据，将不再把该U放到待发送UDT列表中。Receive Queue的超时事件会判断是否有待发送数据，如果有，则重新将U加入。
 int CUDT::packData(CPacket& packet, uint64_t& ts)
 {
    int payload = 0;
@@ -2285,10 +2382,16 @@ int CUDT::packData(CPacket& packet, uint64_t& ts)
 
       payload = m_pSndBuffer->readData(&(packet.m_pcData), offset, packet.m_iMsgNo, msglen);
 
-      if (-1 == payload)
+      if (-1 == payload) // 数据过期
       {
          int32_t seqpair[2];
          seqpair[0] = packet.m_iSeqNo;
+/*
+此处加msglen，seqpair[1]指向的可能为下一个MSG的第一个数据报的序列号
+发送到对端后，对端将认为下一个MSG的第一个数据报为收到，造成混乱。
+需改为：
+seqpair[1] = CSeqNo::incseq(seqpair[0], ((msglen > 1) ? (msglen - 1) : 0));
+*/
          seqpair[1] = CSeqNo::incseq(seqpair[0], msglen);
          sendCtrl(7, &packet.m_iMsgNo, seqpair, 8);
 
@@ -2297,11 +2400,18 @@ int CUDT::packData(CPacket& packet, uint64_t& ts)
 
          // skip all dropped packets
          if (CSeqNo::seqcmp(m_iSndCurrSeqNo, CSeqNo::incseq(seqpair[1])) < 0)
+/*
+m_iSndCurrSeqNo再次加1，相当于MSG最后一个报文的序列号+2
+但下次发送时分配给报文的序列号将再次加1(+3)，造成+2的报文没有发送。对端将受到+3的报文，认为+2丢失，发送+2的NAK。
+
+如果发送端应接收端重发的要求重发+2报文，则+2报文的内容实际为第二个MSG的第一个报文或者第二个报文。如果没有第二个MSG将出现空包或者读错误。
++2报文的内容：是根据与上次确认的报文序列号的偏移量算出的。因为相对于MSG最后一个报文的序列号+2，故造成读取下一个MSG的报文。
+*/
              m_iSndCurrSeqNo = CSeqNo::incseq(seqpair[1]);
 
          return 0;
       }
-      else if (0 == payload)
+      else if (0 == payload) // 为什么有可能等于0？
          return 0;
 
       ++ m_iTraceRetrans;
@@ -2312,6 +2422,9 @@ int CUDT::packData(CPacket& packet, uint64_t& ts)
       // If no loss, pack a new packet.
 
       // check congestion/flow window limit
+      // 发送窗口取m_iFlowWindowSize和m_dCongestionWindow的较小值
+      // 按序读取发送缓冲区中待发送的数据
+      // 窗口起始值以m_iSndLastAck为准
       int cwnd = (m_iFlowWindowSize < (int)m_dCongestionWindow) ? m_iFlowWindowSize : (int)m_dCongestionWindow;
       if (cwnd >= CSeqNo::seqlen(m_iSndLastAck, CSeqNo::incseq(m_iSndCurrSeqNo)))
       {
@@ -2355,12 +2468,22 @@ int CUDT::packData(CPacket& packet, uint64_t& ts)
 
    if (probe)
    {
+/*
+包对：两个连续发送的探测包。
+为了让接收端估算链路带宽，需要连续发送序号为16n和16n+1的包。接收端记录这两个包达到时的时间间隔。
+*/
       // sends out probing packet pair
       ts = entertime;
       probe = false;
    }
    else
    {
+/*
+为了保证以接近理想的速率发送报文，必须根据实际情况修正下次报文发送时间。
+首先判断下个包是否立即发送，如果是，则为当前时间。
+否则，累积延滞时间（预期发送时间与当前时间的差值）大于报文发送间隔时间，则更新为当前时间。
+反之，则为当前时间加上（报文发送间隔时间-累积延滞时间）。
+*/
       #ifndef NO_BUSY_WAITING
          ts = entertime + m_ullInterval;
       #else
@@ -2397,6 +2520,10 @@ int CUDT::processData(CUnit* unit)
    // update time information
    m_pRcvTimeWindow->onPktArrival();
 
+   // 32 33 48 49
+   // 32       49
+   //    33 48
+   // 异常情况，中值过滤
    // check if it is probing packet pair
    if (0 == (packet.m_iSeqNo & 0xF))
       m_pRcvTimeWindow->probe1Arrival();
@@ -2407,6 +2534,7 @@ int CUDT::processData(CUnit* unit)
    ++ m_llRecvTotal;
 
    int32_t offset = CSeqNo::seqoff(m_iRcvLastAck, packet.m_iSeqNo);
+   // 已收 或 接收缓冲区中没有相应的地方存放
    if ((offset < 0) || (offset >= m_pRcvBuffer->getAvailBufSize()))
       return -1;
 
@@ -2414,6 +2542,19 @@ int CUDT::processData(CUnit* unit)
       return -1;
 
    // Loss detection.
+   // 如果收到包的序列号大于(上次收到的+1)，说明中间有丢失
+
+   // 1 2 3 4 5 6 7 8
+   // 如果 1 3 收到，则 2 丢失，接收端只发送一次 2 的NAK。发送端即使没有收到这个NAK，也会在超时事件发生时，把 2 加入到自己的发送丢失列表中。
+   // 利用超时重发数据，数据发送效率会变低。
+   // 超时：在规定的时间（m_iRTT + 4 * m_iRTTVar）内，发送端没有收到对端响应。
+   // 高延迟的网络环境重发效率将极其低下。
+
+// 1 2 3 4 5 6 7 8 9
+// 1   3       7
+// 收到3，则更新m_iRcvCurrSeqNo为3，NAK消息中丢包序号为2，个数为1
+// 收到7，则更新m_iRcvCurrSeqNo为7，NAK消息中丢包序号为[4, 6]，个数为3
+// 后收到2 4 5 6，接收端都不会发送NAK消息
    if (CSeqNo::seqcmp(packet.m_iSeqNo, CSeqNo::incseq(m_iRcvCurrSeqNo)) > 0)
    {
       // If loss found, insert them to the receiver loss list
@@ -2433,7 +2574,8 @@ int CUDT::processData(CUnit* unit)
    }
 
    // This is not a regular fixed size packet...   
-   //an irregular sized packet usually indicates the end of a message, so send an ACK immediately   
+   // an irregular sized packet usually indicates the end of a message, so send an ACK immediately
+   // 这个地方体现出它只能用于大数据传输
    if (packet.getLength() != m_iPayloadSize)   
       CTimer::rdtsc(m_ullNextACKTime); 
 
@@ -2447,6 +2589,7 @@ int CUDT::processData(CUnit* unit)
    return 0;
 }
 
+// addr：UDP包的源地址
 int CUDT::listen(sockaddr* addr, CPacket& packet)
 {
    if (m_bClosing)
@@ -2461,6 +2604,20 @@ int CUDT::listen(sockaddr* addr, CPacket& packet)
    // SYN cookie
    char clienthost[NI_MAXHOST];
    char clientport[NI_MAXSERV];
+
+   // The getnameinfo() function is the inverse of getaddrinfo(3): it
+   // converts a socket address to a corresponding host and service, in a
+   // protocol-independent manner.  It combines the functionality of
+   // gethostbyaddr(3) and getservbyport(3), but unlike those functions,
+   // getnameinfo() is reentrant and allows programs to eliminate
+   // IPv4-versus-IPv6 dependencies.
+
+   // getnameinfo() converts the internal binary representation of an IP address
+   // in the form of a struct sockaddr pointer into text strings consisting of the hostname or,
+   // if the address cannot be resolved into a name, a textual IP address representation,
+   // as well as the service port name or number. 
+
+   // cookie 根据当前时间计算，每分钟一个。验证cookie时，会和当前分钟数以及上一分钟数对应的cookie进行比较。
    getnameinfo(addr, (AF_INET == m_iVersion) ? sizeof(sockaddr_in) : sizeof(sockaddr_in6), clienthost, sizeof(clienthost), clientport, sizeof(clientport), NI_NUMERICHOST|NI_NUMERICSERV);
    int64_t timestamp = (CTimer::getTime() - m_StartTime) / 60000000; // secret changes every one minute
    stringstream cookiestr;
@@ -2541,11 +2698,15 @@ void CUDT::checkTimers()
    uint64_t currtime;
    CTimer::rdtsc(currtime);
 
+   // ACK事件（是否发送ACK数据报 根据时间或者间隔报文个数）
    if ((currtime > m_ullNextACKTime) || ((m_pCC->m_iACKInterval > 0) && (m_pCC->m_iACKInterval <= m_iPktCount)))
    {
       // ACK timer expired or ACK interval is reached
 
+      // 触发发送ACK包，对已收到的数据进行确认。sendCtrl内部将决定是否发送（是重传还是一个新的）、发送的内容等。
       sendCtrl(2);
+
+      // 更新下次ACK事件时间
       CTimer::rdtsc(currtime);
       if (m_pCC->m_iACKPeriod > 0)
          m_ullNextACKTime = currtime + m_pCC->m_iACKPeriod * m_ullCPUFrequency;
@@ -2555,6 +2716,7 @@ void CUDT::checkTimers()
       m_iPktCount = 0;
       m_iLightACKCount = 1;
    }
+   // 通过CCC设置的应答时间间隔和应答个数间隔都非常大，内部会自己发送一个轻量的ACK
    else if (m_iSelfClockInterval * m_iLightACKCount <= m_iPktCount)
    {
       //send a "light" ACK
@@ -2572,6 +2734,7 @@ void CUDT::checkTimers()
    //   m_ullNextNAKTime = currtime + m_ullNAKInt;
    //}
 
+   // m_ullLastRspTime 上次收到报文的时间
    uint64_t next_exp_time;
    if (m_pCC->m_bUserDefinedRTO)
       next_exp_time = m_ullLastRspTime + m_pCC->m_iRTO * m_ullCPUFrequency;
@@ -2583,8 +2746,20 @@ void CUDT::checkTimers()
       next_exp_time = m_ullLastRspTime + exp_int;
    }
 
+   // 超时事件，一段时间内未收到对端数据（包括对端发来的数据以及控制报文）。
+
+   // 高延迟（RTT超过1s）的网络环境，连接请求每个250ms发送一次，收到第一个响应后，连接建立成功。但后续仍会收到响应，这些响应也会刷新m_ullLastRspTime
+   // 对端只要收到握手请求，就会发出响应。
+   // 后续的重复响应导致超时事件的起始时间被覆盖。
+
+   // 用来结束慢启动的超时事件应该单独计算（以第一次发送数据的时间戳为准）
+
+   // EXP is used to trigger data packets retransmission and maintain connection status.
+   // 超时事件 （清理长期不活动的连接，重发数据 or 保活）
    if (currtime > next_exp_time)
    {
+      // m_iEXPCount在收到数据包或者控制包时均会置为1
+      // 如果过期次数累积超过16次，且距离上次收到数据已经过去了5s
       // Haven't receive any information from the peer, is it dead?!
       // timeout: at least 16 expirations and must be greater than 10 seconds
       if ((m_iEXPCount > 16) && (currtime - m_ullLastRspTime > 5000000 * m_ullCPUFrequency))
@@ -2598,19 +2773,24 @@ void CUDT::checkTimers()
          m_bBroken = true;
          m_iBrokenCounter = 30;
 
+         // 该UDT实例的 m_bBroken 已被设置，在下一个处理周期时将会被清理
          // update snd U list to remove this socket
          m_pSndQueue->m_pSndUList->update(this);
 
+         // 释放同步条件
          releaseSynch();
 
          // app can call any UDT API to learn the connection_broken error
          s_UDTUnited.m_EPoll.update_events(m_SocketID, m_sPollID, UDT_EPOLL_IN | UDT_EPOLL_OUT | UDT_EPOLL_ERR, true);
 
+         // 触发事件(select selectEx epoll 在等待该事件发生)
          CTimer::triggerEvent();
 
          return;
       }
 
+      // 重发 or 保活
+      // 如果仍有未发送数据，则优先安排发送；反之，则向对端报送keep-alive报文
       // sender: Insert all the packets sent after last received acknowledgement into the sender loss list.
       // recver: Send out a keep-alive packet
       if (m_pSndBuffer->getCurrBufSize() > 0)
@@ -2618,20 +2798,30 @@ void CUDT::checkTimers()
          if ((CSeqNo::incseq(m_iSndCurrSeqNo) != m_iSndLastAck) && (m_pSndLossList->getLossLength() == 0))
          {
             // resend all unacknowledged packets on timeout, but only if there is no packet in the loss list
+            // 把发送出去但没有确认的数据包都加入到丢失链表中
+            // 但m_iSndLastAck为累积确认，所以虽然对端接收到一些乱序的数据包，但这些乱序的数据包仍然会被重发。（效率低！！！）
+
+            // m_iSndLastAck代表对端确认
             int32_t csn = m_iSndCurrSeqNo;
             int num = m_pSndLossList->insert(m_iSndLastAck, csn);
             m_iTraceSndLoss += num;
             m_iSndLossTotal += num;
          }
 
+         // 拥塞控制处理超时，更新报文发送间隔。拥塞控制处理超时，定是在超时发生，但数据仍未发送完毕的情况下。
+         // 很长时间没有收到对端的报文了，并且是在有数据未发送完毕的情况下，此时定义为超时
          m_pCC->onTimeout();
          CCUpdate();
 
+         // 保证该U在有未发送数据的情况下，一定能得到处理。
+         // 将该UDT实例放到列表顶端，让其在下一个处理周期立即可被处理。
          // immediately restart transmission
          m_pSndQueue->m_pSndUList->update(this);
       }
       else
       {
+         // 未有数据发送的情况下
+         // keep-alive时间间隔为RTO，所以保活时间间隔相当小
          sendCtrl(1);
       }
 

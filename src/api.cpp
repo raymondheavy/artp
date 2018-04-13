@@ -313,6 +313,7 @@ UDTSOCKET CUDTUnited::newSocket(int af, int type)
    return ns->m_SocketID;
 }
 
+// peer: 对端地址，报文的源地址（）
 int CUDTUnited::newConnection(const UDTSOCKET listen, const sockaddr* peer, CHandShake* hs)
 {
    CUDTSocket* ns = NULL;
@@ -342,6 +343,10 @@ int CUDTUnited::newConnection(const UDTSOCKET listen, const sockaddr* peer, CHan
 
          hs->m_iISN = ns->m_pUDT->m_iISN;
          hs->m_iMSS = ns->m_pUDT->m_iMSS;
+
+         // m_pUDT->m_iFlightFlagSize 
+         // UDT实例的m_iFlightFlagSize除了setOpt()函数对其进行修改，没有其他地方对其进行修改
+         // 因此在未setOpt()的情况下，其值为默认的25600(0x6400)
          hs->m_iFlightFlagSize = ns->m_pUDT->m_iFlightFlagSize;
          hs->m_iReqType = -1;
          hs->m_iID = ns->m_SocketID;
@@ -409,8 +414,11 @@ int CUDTUnited::newConnection(const UDTSOCKET listen, const sockaddr* peer, CHan
    ns->m_Status = CONNECTED;
 
    // copy address information of local node
+   // UDP getsockname方法只能获取本地端口号,而不能获取到本地ip地址
    ns->m_pUDT->m_pSndQueue->m_pChannel->getSockAddr(ns->m_pSelfAddr);
+   // 利用建立连接的UDT实例中的自身IP更新UDT socket对应的IP
    CIPAddress::pton(ns->m_pSelfAddr, ns->m_pUDT->m_piSelfIP, ns->m_iIPversion);
+   // 通过上面两个过程，确定了UDT socket对应的本地IP+PORT
 
    // protect the m_Sockets structure.
    CGuard::enterCS(m_ControlLock);
@@ -748,7 +756,9 @@ int CUDTUnited::connect(const UDTSOCKET u, const sockaddr* name, int namelen)
    // a socket can "connect" only if it is in INIT or OPENED status
    if (INIT == s->m_Status)
    {
-      if (!s->m_pUDT->m_bRendezvous)
+      // C/S模式中的C端有可能不bind，直接去connect，因此需要open。
+      // rendezvous mode 下要求必须先bind
+      if (!s->m_pUDT->m_bRendezvous) // 
       {
          s->m_pUDT->open();
          updateMux(s);
@@ -796,6 +806,7 @@ void CUDTUnited::connect_complete(const UDTSOCKET u)
    if (NULL == s)
       throw CUDTException(5, 4, 0);
 
+   // 确定了UDT socket对应的本地IP+Port
    // copy address information of local node
    // the local port must be correctly assigned BEFORE CUDT::connect(),
    // otherwise if connect() fails, the multiplexer cannot be located by garbage collection and will cause leak
@@ -1183,6 +1194,7 @@ void CUDTUnited::checkBrokenSockets()
    vector<UDTSOCKET> tbc;
    vector<UDTSOCKET> tbr;
 
+   // cleanup之后，m_Sockets在garbageCollect会被强制清空
    for (map<UDTSOCKET, CUDTSocket*>::iterator i = m_Sockets.begin(); i != m_Sockets.end(); ++ i)
    {
       // check broken connection
@@ -1222,11 +1234,13 @@ void CUDTUnited::checkBrokenSockets()
       }
    }
 
+   // 处理待关闭套接字。cleanup将强制所有套接字进入到待关闭状态
    for (map<UDTSOCKET, CUDTSocket*>::iterator j = m_ClosedSockets.begin(); j != m_ClosedSockets.end(); ++ j)
    {
       if (j->second->m_pUDT->m_ullLingerExpiration > 0)
       {
          // asynchronous close: 
+         // 异步关闭的套接字：没有待发送数据或等待发送超时
          if ((NULL == j->second->m_pUDT->m_pSndBuffer) || (0 == j->second->m_pUDT->m_pSndBuffer->getCurrBufSize()) || (j->second->m_pUDT->m_ullLingerExpiration <= CTimer::getTime()))
          {
             j->second->m_pUDT->m_ullLingerExpiration = 0;
@@ -1236,6 +1250,7 @@ void CUDTUnited::checkBrokenSockets()
       }
 
       // timeout 1 second to destroy a socket AND it has been removed from RcvUList
+      // 销毁socket，需至少在1s后，且从recv queue的接收队列中被删除
       if ((CTimer::getTime() - j->second->m_TimeStamp > 1000000) && ((NULL == j->second->m_pUDT->m_pRNode) || !j->second->m_pUDT->m_pRNode->m_bOnList))
       {
          tbr.push_back(j->first);
@@ -1262,6 +1277,7 @@ void CUDTUnited::removeSocket(const UDTSOCKET u)
    // decrease multiplexer reference count, and remove it if necessary
    const int mid = i->second->m_iMuxID;
 
+   // 将所有等待建立连接的套接字所对应的UDT实例关闭，标记为断开，并将其加入到待关闭套接字队列中
    if (NULL != i->second->m_pQueuedSockets)
    {
       CGuard::enterCS(i->second->m_AcceptLock);
@@ -1302,6 +1318,7 @@ void CUDTUnited::removeSocket(const UDTSOCKET u)
       return;
    }
 
+   // 待复用器的引用计数为0后，删除该复用器
    m->second.m_iRefCount --;
    if (0 == m->second.m_iRefCount)
    {
@@ -1359,6 +1376,7 @@ void CUDTUnited::checkTLSValue()
          tbr.push_back(i->first);
          break;
       }
+      // 线程的句柄在WIN32中可以作为信号量使用。当线程结束时，其状态由非信号状态转变为信号状态，WaitForSingleObject才有信号
       if (WAIT_OBJECT_0 == WaitForSingleObject(h, 0))
       {
          delete i->second;
@@ -1371,6 +1389,14 @@ void CUDTUnited::checkTLSValue()
 }
 #endif
 
+// void updateMux(CUDTSocket* s, const sockaddr* addr = NULL, const UDPSOCKET* = NULL);
+// 如果s允许重用地址，则在已有多路复用器上查找是否有符合条件的多路复用器（端口、IP版本、MSS大小、该多路复用器挂载的socket是否允许复用），如果有则复用。
+// addr 欲绑定的地址
+// udpsock 欲使用的udp socket，并将用s的option值更新该系统 udp socket（bind2函数，用来绑定系统socket）
+// 该函数在API bind2()中被使用
+
+// 在s允许复用端口的情况下，查找当前复用器中有没有合适的复用器
+// s和复用器之间比较：IP版本、MSS大小、复用器是否允许被复用、端口，如果满足上述条件，则复用,不再创建复用器
 void CUDTUnited::updateMux(CUDTSocket* s, const sockaddr* addr, const UDPSOCKET* udpsock)
 {
    CGuard cg(m_ControlLock);
@@ -1396,6 +1422,9 @@ void CUDTUnited::updateMux(CUDTSocket* s, const sockaddr* addr, const UDPSOCKET*
          }
       }
    }
+
+   // 不可复用的情况下，将会创建新的复用器。如果该addr（ip+port）已经被使用，则将会受影响。
+   // 也就是说不支持在同一个addr（ip+port）上创建不同的复用器（比如两个不同的UDT socket对应同一个addr（ip+port），但不支持设置不同的MSS）。
 
    // a new multiplexer is needed
    CMultiplexer m;
@@ -1442,6 +1471,11 @@ void CUDTUnited::updateMux(CUDTSocket* s, const sockaddr* addr, const UDPSOCKET*
    s->m_iMuxID = m.m_iID;
 }
 
+// 将s绑定到ls对应的多路复用器上
+// s 为新建连接的套接字
+// ls 本地监听套接字
+
+// 新建连接时，
 void CUDTUnited::updateMux(CUDTSocket* s, const CUDTSocket* ls)
 {
    CGuard cg(m_ControlLock);
@@ -1451,7 +1485,7 @@ void CUDTUnited::updateMux(CUDTSocket* s, const CUDTSocket* ls)
    // find the listener's address
    for (map<int, CMultiplexer>::iterator i = m_mMultiplexer.begin(); i != m_mMultiplexer.end(); ++ i)
    {
-      if (i->second.m_iPort == port)
+      if (i->second.m_iPort == port) // 此处有bug，如果在一个端口同时绑定了ipv4 ipv6的套接字，较后绑定的复用器将被使用，判断条件要将上IP版本和MSS
       {
          // reuse the existing multiplexer
          ++ i->second.m_iRefCount;
@@ -1473,10 +1507,12 @@ void CUDTUnited::updateMux(CUDTSocket* s, const CUDTSocket* ls)
 
    CGuard gcguard(self->m_GCStopLock);
 
+   // 1s检查一次
    while (!self->m_bClosing)
    {
       self->checkBrokenSockets();
 
+      // 清理Exception占用的资源
       #ifdef WIN32
          self->checkTLSValue();
       #endif
@@ -1498,6 +1534,7 @@ void CUDTUnited::updateMux(CUDTSocket* s, const CUDTSocket* ls)
    CGuard::enterCS(self->m_ControlLock);
    for (map<UDTSOCKET, CUDTSocket*>::iterator i = self->m_Sockets.begin(); i != self->m_Sockets.end(); ++ i)
    {
+      // 标记作废，调用关闭，并标记为CLOSED，更新关闭时间戳，将Socket对象加入已关闭列表
       i->second->m_pUDT->m_bBroken = true;
       i->second->m_pUDT->close();
       i->second->m_Status = CLOSED;
@@ -1505,6 +1542,7 @@ void CUDTUnited::updateMux(CUDTSocket* s, const CUDTSocket* ls)
       self->m_ClosedSockets[i->first] = i->second;
 
       // remove from listener's queue
+      // 判断该套接字是否是某一个监听套接字建立的，不属于则不做处理，属于则查找是哪一个监听套接字建立的
       map<UDTSOCKET, CUDTSocket*>::iterator ls = self->m_Sockets.find(i->second->m_ListenSocket);
       if (ls == self->m_Sockets.end())
       {
@@ -1513,6 +1551,7 @@ void CUDTUnited::updateMux(CUDTSocket* s, const CUDTSocket* ls)
             continue;
       }
 
+      // ls为监听套接字，在ls的套接字队列中去掉该套接字
       CGuard::enterCS(ls->second->m_AcceptLock);
       ls->second->m_pQueuedSockets->erase(i->second->m_SocketID);
       ls->second->m_pAcceptSockets->erase(i->second->m_SocketID);
@@ -1520,6 +1559,7 @@ void CUDTUnited::updateMux(CUDTSocket* s, const CUDTSocket* ls)
    }
    self->m_Sockets.clear();
 
+   // 将所有待关闭套接字的关闭时间更新为0，立即关闭
    for (map<UDTSOCKET, CUDTSocket*>::iterator j = self->m_ClosedSockets.begin(); j != self->m_ClosedSockets.end(); ++ j)
    {
       j->second->m_TimeStamp = 0;

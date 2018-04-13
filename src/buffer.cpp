@@ -64,6 +64,9 @@ m_iCount(0)
 
    // circular linked list for out bound packets
    m_pBlock = new Block;
+   // 应该提前赋初值 m_pNext m_iLength m_iMsgNo等。避免m_iSize=1时，没有做初始化
+
+   // 环形
    Block* pb = m_pBlock;
    for (int i = 1; i < m_iSize; ++ i)
    {
@@ -73,6 +76,8 @@ m_iCount(0)
    }
    pb->m_pNext = m_pBlock;
 
+   // 最后一个pb的m_iMsgNo没有赋值
+
    pb = m_pBlock;
    char* pc = m_pBuffer->m_pcData;
    for (int i = 0; i < m_iSize; ++ i)
@@ -81,6 +86,10 @@ m_iCount(0)
       pb = pb->m_pNext;
       pc += m_iMSS;
    }
+
+   // m_pFirstBlock 待确认指针，下一次要确认的位置，offset必定大于0
+   // m_pCurrBlock  待读指针，从发送缓冲区读取数据，下一次要读取的位置
+   // m_pLastBlock  待写指针，向发送缓冲区添加数据，下一次要写的位置
 
    m_pFirstBlock = m_pCurrBlock = m_pLastBlock = m_pBlock;
 
@@ -214,6 +223,7 @@ int CSndBuffer::addBufferFromFile(fstream& ifs, int len)
    return total;
 }
 
+// 按序读取
 int CSndBuffer::readData(char** data, int32_t& msgno)
 {
    // No data to read
@@ -229,6 +239,8 @@ int CSndBuffer::readData(char** data, int32_t& msgno)
    return readlen;
 }
 
+// 读取指定位置的报文
+// offset 为相对于上次确认位置的偏移量
 int CSndBuffer::readData(char** data, const int offset, int32_t& msgno, int& msglen)
 {
    CGuard bufferguard(m_BufLock);
@@ -240,6 +252,8 @@ int CSndBuffer::readData(char** data, const int offset, int32_t& msgno, int& msg
 
    if ((p->m_iTTL >= 0) && ((CTimer::getTime() - p->m_OriginTime) / 1000 > (uint64_t)p->m_iTTL))
    {
+      // 数据已过期
+
       msgno = p->m_iMsgNo & 0x1FFFFFFF;
 
       msglen = 1;
@@ -247,7 +261,7 @@ int CSndBuffer::readData(char** data, const int offset, int32_t& msgno, int& msg
       bool move = false;
       while (msgno == (p->m_iMsgNo & 0x1FFFFFFF))
       {
-         if (p == m_pCurrBlock)
+         if (p == m_pCurrBlock) // 是否需要更新读指针，让读指针跳过该MSG所占区间
             move = true;
          p = p->m_pNext;
          if (move)
@@ -265,6 +279,7 @@ int CSndBuffer::readData(char** data, const int offset, int32_t& msgno, int& msg
    return readlen;
 }
 
+// 确认的报文区间[m_pFirstBlock, m_pFirstBlock + offset)，m_pFirstBlock = m_pFirstBlock + offset
 void CSndBuffer::ackData(int offset)
 {
    CGuard bufferguard(m_BufLock);
@@ -390,21 +405,27 @@ int CRcvBuffer::addData(CUnit* unit, int offset)
 
 int CRcvBuffer::readBuffer(char* data, int len)
 {
-   int p = m_iStartPos;
-   int lastack = m_iLastAckPos;
+   // m_iStartPos 上一次读取的位置
+   int p = m_iStartPos; // 读指针
+   int lastack = m_iLastAckPos; // 写指针
    int rs = len;
+
+   // m_iNotch 上一次读取数据时，如果单元内的数据未完全读取，记录读取位置，以被后续读取。
 
    while ((p != lastack) && (rs > 0))
    {
       int unitsize = m_pUnit[p]->m_Packet.getLength() - m_iNotch;
       if (unitsize > rs)
          unitsize = rs;
+      // rs 剩余要读取的大小
+      // unitsize 本单元本次要读取的大小
 
       memcpy(data, m_pUnit[p]->m_Packet.m_pcData + m_iNotch, unitsize);
       data += unitsize;
 
       if ((rs > unitsize) || (rs == m_pUnit[p]->m_Packet.getLength() - m_iNotch))
       {
+         // 该单元的数据被完整读取后，置空
          CUnit* tmp = m_pUnit[p];
          m_pUnit[p] = NULL;
          tmp->m_iFlag = 0;
@@ -516,7 +537,7 @@ int CRcvBuffer::readMsg(char* data, int len)
          rs -= unitsize;
       }
 
-      if (!passack)
+      if (!passack) // 数据已得到确认
       {
          CUnit* tmp = m_pUnit[p];
          m_pUnit[p] = NULL;
@@ -530,6 +551,10 @@ int CRcvBuffer::readMsg(char* data, int len)
          p = 0;
    }
 
+   // 数据已得到确认（保证读指针始终不大于写指针？）
+   // if the buf is not enough to hold the first message, 
+   // only part of the message will be copied into the buffer, 
+   // but the message will still be discarded after this recvmsg call.
    if (!passack)
       m_iStartPos = (q + 1) % m_iSize;
 
@@ -545,6 +570,7 @@ int CRcvBuffer::getRcvMsgNum()
 
 bool CRcvBuffer::scanMsg(int& p, int& q, bool& passack)
 {
+   // m_iMaxPos代表的是最远packet与已确认数据区之间的距离
    // empty buffer
    if ((m_iStartPos == m_iLastAckPos) && (m_iMaxPos <= 0))
       return false;
@@ -558,7 +584,18 @@ bool CRcvBuffer::scanMsg(int& p, int& q, bool& passack)
             m_iStartPos = 0;
          continue;
       }
-
+/*
+The next 32-bit field in the header is for the messaging. The first
+two bits "FF" flags the position of the packet is a message. "10" is
+the first packet, "01" is the last one, "11" is the only packet, and
+"00" is any packets in the middle. The third bit "O" means if the
+message should be delivered in order (1) or not (0). A message to be
+delivered in order requires that all previous messages must be either
+delivered or dropped. The rest 29 bits is the message number, similar
+to packet sequence number (but independent). A UDT message may
+contain multiple UDT packets.
+*/
+      // 是否为Msg的第一个packet
       if ((1 == m_pUnit[m_iStartPos]->m_iFlag) && (m_pUnit[m_iStartPos]->m_Packet.getMsgBoundary() > 1))
       {
          bool good = true;
@@ -566,12 +603,15 @@ bool CRcvBuffer::scanMsg(int& p, int& q, bool& passack)
          // look ahead for the whole message
          for (int i = m_iStartPos; i != m_iLastAckPos;)
          {
+            // 当前CUnit是否为null或还未处于被占用状态（数据是否可读）
             if ((NULL == m_pUnit[i]) || (1 != m_pUnit[i]->m_iFlag))
             {
+               // 表明Msg中有洞，不完整，跳出内循环，重新寻找Msg头
                good = false;
                break;
             }
 
+            // 是否为Msg最后一个packet
             if ((m_pUnit[i]->m_Packet.getMsgBoundary() == 1) || (m_pUnit[i]->m_Packet.getMsgBoundary() == 3))
                break;
 
@@ -579,10 +619,12 @@ bool CRcvBuffer::scanMsg(int& p, int& q, bool& passack)
                i = 0;
          }
 
+         // 是否找到一段完整的Msg
          if (good)
             break;
       }
 
+      // 单元位置置空，返还单元给m_pUnitQueue
       CUnit* tmp = m_pUnit[m_iStartPos];
       m_pUnit[m_iStartPos] = NULL;
       tmp->m_iFlag = 0;
@@ -594,9 +636,10 @@ bool CRcvBuffer::scanMsg(int& p, int& q, bool& passack)
 
    p = -1;                  // message head
    q = m_iStartPos;         // message tail
-   passack = m_iStartPos == m_iLastAckPos;
+   passack = m_iStartPos == m_iLastAckPos; // 是否已确认
    bool found = false;
 
+   // m_iMaxPos + getRcvDataSize() 在尽可能大的范围内查找。
    // looking for the first message
    for (int i = 0, n = m_iMaxPos + getRcvDataSize(); i <= n; ++ i)
    {
@@ -604,29 +647,31 @@ bool CRcvBuffer::scanMsg(int& p, int& q, bool& passack)
       {
          switch (m_pUnit[q]->m_Packet.getMsgBoundary())
          {
-         case 3: // 11
+         case 3: // 11 只有一个packet
             p = q;
             found = true;
             break;
 
-         case 2: // 10
+         case 2: // 10 第一个
             p = q;
             break;
 
-         case 1: // 01
-            if (p != -1)
+         case 1: // 01 最后一个
+            if (p != -1) // 找到第一个的情况下
                found = true;
          }
       }
       else
       {
          // a hole in this message, not valid, restart search
+         // 出现无效数据，则重置Msg头，重新查找
          p = -1;
       }
 
       if (found)
       {
          // the msg has to be ack'ed or it is allowed to read out of order, and was not read before
+         // Msg都已得到确认 或者 Msg可不按序读取
          if (!passack || !m_pUnit[q]->m_Packet.getMsgOrderFlag())
             break;
 
@@ -636,7 +681,7 @@ bool CRcvBuffer::scanMsg(int& p, int& q, bool& passack)
       if (++ q == m_iSize)
          q = 0;
 
-      if (q == m_iLastAckPos)
+      if (q == m_iLastAckPos) // 如果msg所占区间跨过了上次确认位置，也就代表msg的部分数据还未得到确认
          passack = true;
    }
 
